@@ -34,7 +34,7 @@ const uint16_t MQTT_PORT = 8883;
 const char* MQTT_USERNAME = "aquasave-edge";
 const char* MQTT_PASSWORD_MQTT = "Aquasave123";
 
-const char* FIRMWARE_VERSION = "2.1.0";
+const char* FIRMWARE_VERSION = "2.2.0";
 
 // ─── Aprovisionamiento WiFi (Access Point + portal HTTP) ────────────────────
 // El WiFi y el DEVICE_ID YA NO se hardcodean: los entrega la app AquaSave.
@@ -88,9 +88,21 @@ int adcMojadoObservado = ADC_MOJADO;      // minimo ADC visto (mas mojado)
 int adcSecoGuardado    = 0;               // ultimo valor persistido en NVS
 int adcMojadoGuardado  = 0;
 
-const int SUELO_SECO_PCT   = 35;
-const int SUELO_HUMEDO_PCT = 70;
+// ─── Riego automatico por PULSOS ────────────────────────────────────────────
+// En vez de dejar la bomba encendida hasta alcanzar el objetivo (desperdicio
+// de agua y bomba "prendida a cada rato"), se riega en pulsos cortos y se
+// deja que el agua se absorba antes de volver a evaluar:
+//   humedad <= UMBRAL_RIEGO_PCT -> pulso de PULSO_RIEGO_MS -> descanso de
+//   ESPERA_TRAS_PULSO_MS -> si sigue seco, otro pulso... hasta estabilizar.
 
+const int UMBRAL_RIEGO_PCT = 40;   // regar por debajo de este % de humedad
+const int SUELO_HUMEDO_PCT = 70;   // objetivo: cortar el pulso al llegar aqui
+
+const unsigned long PULSO_RIEGO_MS      = 60UL * 1000UL;        // 1 minuto
+const unsigned long ESPERA_TRAS_PULSO_MS = 60UL * 60UL * 1000UL; // 1 hora
+
+// Refuerzo por clima: si hace calor y el aire esta seco, tambien dispara un
+// pulso aunque el suelo este en zona intermedia (respetando el descanso).
 const float TEMP_ALTA          = 30.0;
 const float HUMEDAD_AIRE_BAJA  = 40.0;
 
@@ -121,6 +133,15 @@ ModoRiego modo = MODO_AUTO;
 bool bombaEncendida = false;
 unsigned long manualDesdeMs = 0;
 unsigned long tiempoAnterior = 0;
+
+// Pulsos del riego automatico.
+unsigned long pulsoInicioMs   = 0;  // inicio del pulso en curso
+unsigned long ultimoPulsoFinMs = 0; // fin del ultimo pulso (0 = nunca rego)
+
+// Pausa remota (comando pause-device desde la app). Persistida en NVS: un
+// dispositivo pausado no riega (ni auto ni manual) hasta recibir
+// resume-device, pero sigue reportando telemetria para poder reactivarlo.
+bool dispositivoPausado = false;
 
 // ─── MQTT ───────────────────────────────────────────────────────────────────
 
@@ -519,11 +540,22 @@ bool hayLecturaDHT() {
 //  CALIBRACION AUTOAJUSTABLE DEL SENSOR DE SUELO
 // ═════════════════════════════════════════════════════════════════════════════
 
+// Persistir el estado de pausa remota (sobrevive reinicios y apagones).
+void guardarPausa(bool pausado) {
+  prefs.begin("aquasave", false);
+  prefs.putBool("pausado", pausado);
+  prefs.end();
+}
+
 void cargarCalibracion() {
   prefs.begin("aquasave", true);  // solo lectura
   adcSecoObservado   = prefs.getInt("adcSeco", ADC_SECO_AIRE);
   adcMojadoObservado = prefs.getInt("adcMojado", ADC_MOJADO);
+  dispositivoPausado = prefs.getBool("pausado", false);
   prefs.end();
+  if (dispositivoPausado) {
+    Serial.println("[NVS] Dispositivo en PAUSA (reactivar desde la app)");
+  }
   adcSecoGuardado   = adcSecoObservado;
   adcMojadoGuardado = adcMojadoObservado;
   Serial.printf("[CAL] Ventana ADC: seco=%d mojado=%d\n",
@@ -573,6 +605,12 @@ int adcAporcentaje(int adc) {
 }
 
 void actualizarBomba(int humedadSueloPct) {
+  // Dispositivo pausado desde la app: la bomba nunca enciende.
+  if (dispositivoPausado) {
+    bombaEncendida = false;
+    return;
+  }
+
   if (modo == MODO_MANUAL_ON) {
     const bool timeout  = millis() - manualDesdeMs >= MANUAL_MAX_MS;
     const bool saturado = humedadSueloPct >= SUELO_SATURADO_PCT;
@@ -590,7 +628,26 @@ void actualizarBomba(int humedadSueloPct) {
     return;
   }
 
-  const bool sueloSeco   = humedadSueloPct <= SUELO_SECO_PCT;
+  // ── Modo automatico por PULSOS ──────────────────────────────────────
+  // Nunca deja la bomba encendida de forma continua: riega PULSO_RIEGO_MS,
+  // descansa ESPERA_TRAS_PULSO_MS para que el agua se absorba, y solo si el
+  // suelo sigue seco vuelve a regar.
+
+  if (bombaEncendida) {
+    // Pulso en curso: cortar al cumplir el tiempo o al llegar al objetivo.
+    const bool pulsoCompleto     = millis() - pulsoInicioMs >= PULSO_RIEGO_MS;
+    const bool objetivoAlcanzado = humedadSueloPct >= SUELO_HUMEDO_PCT;
+    if (pulsoCompleto || objetivoAlcanzado) {
+      bombaEncendida   = false;
+      ultimoPulsoFinMs = millis();
+      Serial.println(objetivoAlcanzado
+        ? "[RIEGO] Pulso cortado: humedad objetivo alcanzada"
+        : "[RIEGO] Pulso completo: esperando absorcion del agua");
+    }
+    return;
+  }
+
+  const bool sueloSeco   = humedadSueloPct <= UMBRAL_RIEGO_PCT;
   const bool sueloHumedo = humedadSueloPct >= SUELO_HUMEDO_PCT;
 
   bool ambienteCalienteSeco = false;
@@ -599,9 +656,18 @@ void actualizarBomba(int humedadSueloPct) {
       ultimaTemperatura >= TEMP_ALTA && ultimaHumedadAire <= HUMEDAD_AIRE_BAJA;
   }
 
-  if (sueloSeco) bombaEncendida = true;
-  if (!sueloHumedo && ambienteCalienteSeco) bombaEncendida = true;
-  if (sueloHumedo) bombaEncendida = false;
+  const bool necesitaRiego =
+    sueloSeco || (!sueloHumedo && ambienteCalienteSeco);
+  const bool descansoCumplido =
+    ultimoPulsoFinMs == 0 ||
+    millis() - ultimoPulsoFinMs >= ESPERA_TRAS_PULSO_MS;
+
+  if (necesitaRiego && descansoCumplido) {
+    bombaEncendida = true;
+    pulsoInicioMs  = millis();
+    Serial.printf("[RIEGO] Pulso automatico iniciado (humedad %d %%)\n",
+                  humedadSueloPct);
+  }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -728,14 +794,35 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   Serial.printf("[MQTT] Comando recibido: %s (%s)\n", type, commandId);
 
   if (strcmp(type, "open-valve") == 0) {
-    modo = MODO_MANUAL_ON;
-    manualDesdeMs = millis();
-    bombaEncendida = true;
-    digitalWrite(PIN_RELE, HIGH);
+    if (dispositivoPausado) {
+      // Pausado: no regar, pero confirmar el comando para que el backend no
+      // lo reintente eternamente.
+      Serial.println("[MQTT] open-valve ignorado: dispositivo en pausa");
+    } else {
+      modo = MODO_MANUAL_ON;
+      manualDesdeMs = millis();
+      bombaEncendida = true;
+      digitalWrite(PIN_RELE, HIGH);
+    }
   } else if (strcmp(type, "close-valve") == 0) {
     modo = MODO_AUTO;
     bombaEncendida = false;
     digitalWrite(PIN_RELE, LOW);
+    // El usuario detuvo el riego: respetar el descanso entre pulsos para que
+    // el modo automatico no vuelva a encender la bomba segundos despues.
+    ultimoPulsoFinMs = millis();
+  } else if (strcmp(type, "pause-device") == 0) {
+    // Pausa remota: apagar bomba y bloquear todo riego hasta resume-device.
+    dispositivoPausado = true;
+    modo = MODO_AUTO;
+    bombaEncendida = false;
+    digitalWrite(PIN_RELE, LOW);
+    guardarPausa(true);
+    Serial.println("[MQTT] Dispositivo PAUSADO remotamente");
+  } else if (strcmp(type, "resume-device") == 0) {
+    dispositivoPausado = false;
+    guardarPausa(false);
+    Serial.println("[MQTT] Dispositivo REACTIVADO remotamente");
   } else {
     Serial.printf("[MQTT] Tipo de comando desconocido: %s\n", type);
     return;
@@ -762,7 +849,7 @@ void imprimirLectura(int adcSuelo, int humedadSueloPct) {
   Serial.printf("ADC suelo: %d (%d %%)\n", adcSuelo, humedadSueloPct);
 
   Serial.print("Estado suelo: ");
-  if (humedadSueloPct <= SUELO_SECO_PCT) Serial.println("SECO");
+  if (humedadSueloPct <= UMBRAL_RIEGO_PCT) Serial.println("SECO");
   else if (humedadSueloPct >= SUELO_HUMEDO_PCT) Serial.println("HUMEDO");
   else Serial.println("INTERMEDIO");
 
@@ -776,7 +863,10 @@ void imprimirLectura(int adcSuelo, int humedadSueloPct) {
     Serial.println("DHT: SIN LECTURA");
   }
 
-  Serial.printf("Modo: %s\n", modo == MODO_AUTO ? "AUTO" : "MANUAL (app)");
+  Serial.printf("Modo: %s\n",
+                dispositivoPausado ? "PAUSADO (app)"
+                : modo == MODO_AUTO ? "AUTO"
+                : "MANUAL (app)");
   Serial.printf("Bomba: %s\n", bombaEncendida ? "ENCENDIDA" : "APAGADA");
 
   Serial.printf(
