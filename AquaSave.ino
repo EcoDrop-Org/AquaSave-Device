@@ -34,7 +34,7 @@ const uint16_t MQTT_PORT = 8883;
 const char* MQTT_USERNAME = "aquasave-edge";
 const char* MQTT_PASSWORD_MQTT = "Aquasave123";
 
-const char* FIRMWARE_VERSION = "2.0.0";
+const char* FIRMWARE_VERSION = "2.1.0";
 
 // ─── Aprovisionamiento WiFi (Access Point + portal HTTP) ────────────────────
 // El WiFi y el DEVICE_ID YA NO se hardcodean: los entrega la app AquaSave.
@@ -68,10 +68,25 @@ unsigned long bootPressedSince = 0;
 #define PIN_RELE         26
 #define PIN_BOOT         0    // boton BOOT: mantener 3 s = re-aprovisionar
 
-// ─── Calibracion del sensor de suelo ────────────────────────────────────────
+// ─── Calibracion del sensor de suelo (AUTOAJUSTABLE) ────────────────────────
+// Valores iniciales tipicos del HW-390. El firmware ajusta la ventana con los
+// extremos realmente observados y los persiste en NVS: si tu sensor entrega
+// valores fuera del rango inicial, la humedad ya no se clava en 0 o 100 %.
 
-const int ADC_SECO_AIRE  = 2600;
-const int ADC_MOJADO     = 1100;
+const int ADC_SECO_AIRE  = 2600;  // 0 % humedad (valor inicial)
+const int ADC_MOJADO     = 1100;  // 100 % humedad (valor inicial)
+
+// Lecturas fuera de este rango = sensor desconectado o ruido electrico: se
+// reportan pero NO recalibran la ventana.
+const int ADC_VALIDO_MIN = 80;
+const int ADC_VALIDO_MAX = 4020;
+// Ancho minimo de la ventana observada para confiar en ella.
+const int ADC_VENTANA_MIN = 400;
+
+int adcSecoObservado   = ADC_SECO_AIRE;   // maximo ADC visto (mas seco)
+int adcMojadoObservado = ADC_MOJADO;      // minimo ADC visto (mas mojado)
+int adcSecoGuardado    = 0;               // ultimo valor persistido en NVS
+int adcMojadoGuardado  = 0;
 
 const int SUELO_SECO_PCT   = 35;
 const int SUELO_HUMEDO_PCT = 70;
@@ -148,8 +163,9 @@ void setup() {
 
   detectarDHT();
 
-  // Cargar credenciales guardadas (WiFi + deviceId).
+  // Cargar credenciales guardadas (WiFi + deviceId) y calibracion del suelo.
   cargarCredenciales();
+  cargarCalibracion();
 
   if (WIFI_SSID.length() == 0 || DEVICE_ID.length() == 0) {
     // Sin configurar -> modo aprovisionamiento (Access Point + portal HTTP).
@@ -206,7 +222,7 @@ void loop() {
     digitalWrite(PIN_RELE, bombaEncendida ? HIGH : LOW);
 
     imprimirLectura(adcSuelo, humedadSueloPct);
-    publicarTelemetria(humedadSueloPct);
+    publicarTelemetria(humedadSueloPct, adcSuelo);
   }
 }
 
@@ -500,11 +516,59 @@ bool hayLecturaDHT() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  CALIBRACION AUTOAJUSTABLE DEL SENSOR DE SUELO
+// ═════════════════════════════════════════════════════════════════════════════
+
+void cargarCalibracion() {
+  prefs.begin("aquasave", true);  // solo lectura
+  adcSecoObservado   = prefs.getInt("adcSeco", ADC_SECO_AIRE);
+  adcMojadoObservado = prefs.getInt("adcMojado", ADC_MOJADO);
+  prefs.end();
+  adcSecoGuardado   = adcSecoObservado;
+  adcMojadoGuardado = adcMojadoObservado;
+  Serial.printf("[CAL] Ventana ADC: seco=%d mojado=%d\n",
+                adcSecoObservado, adcMojadoObservado);
+}
+
+// Persiste los extremos observados solo cuando cambian de forma apreciable,
+// para no desgastar la flash con escrituras cada 5 s.
+void guardarCalibracionSiCambio() {
+  if (abs(adcSecoObservado - adcSecoGuardado) < 25 &&
+      abs(adcMojadoObservado - adcMojadoGuardado) < 25) {
+    return;
+  }
+  prefs.begin("aquasave", false);
+  prefs.putInt("adcSeco", adcSecoObservado);
+  prefs.putInt("adcMojado", adcMojadoObservado);
+  prefs.end();
+  adcSecoGuardado   = adcSecoObservado;
+  adcMojadoGuardado = adcMojadoObservado;
+  Serial.printf("[CAL] Ventana ADC guardada: seco=%d mojado=%d\n",
+                adcSecoObservado, adcMojadoObservado);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 //  LOGICA DE RIEGO
 // ═════════════════════════════════════════════════════════════════════════════
 
 int adcAporcentaje(int adc) {
-  const long pct = map(adc, ADC_SECO_AIRE, ADC_MOJADO, 0, 100);
+  // Auto-ajuste: ampliar la ventana con extremos reales (lecturas validas).
+  if (adc >= ADC_VALIDO_MIN && adc <= ADC_VALIDO_MAX) {
+    if (adc > adcSecoObservado)   adcSecoObservado = adc;
+    if (adc < adcMojadoObservado) adcMojadoObservado = adc;
+    guardarCalibracionSiCambio();
+  }
+
+  // Si la ventana observada es demasiado angosta (recien calibrando o sensor
+  // plano), usar la ventana inicial de referencia.
+  int seco   = adcSecoObservado;
+  int mojado = adcMojadoObservado;
+  if (seco - mojado < ADC_VENTANA_MIN) {
+    seco   = ADC_SECO_AIRE;
+    mojado = ADC_MOJADO;
+  }
+
+  const long pct = map(adc, seco, mojado, 0, 100);
   return constrain((int)pct, 0, 100);
 }
 
@@ -622,11 +686,14 @@ void publicarStatusOnline() {
   mqtt.publish(topicStatus.c_str(), buffer, true);
 }
 
-void publicarTelemetria(int humedadSueloPct) {
+void publicarTelemetria(int humedadSueloPct, int adcRaw) {
   if (!mqtt.connected()) return;
 
   JsonDocument doc;
   doc["soilMoisturePct"] = humedadSueloPct;
+  // ADC crudo para diagnostico/calibracion (el edge lo ignora; visible en el
+  // web client de HiveMQ).
+  doc["adcRaw"] = adcRaw;
 
   if (hayLecturaDHT()) {
     doc["temperatureC"] = serialized(String(ultimaTemperatura, 1));
