@@ -34,7 +34,7 @@ const uint16_t MQTT_PORT = 8883;
 const char* MQTT_USERNAME = "aquasave-edge";
 const char* MQTT_PASSWORD_MQTT = "Aquasave123";
 
-const char* FIRMWARE_VERSION = "2.2.0";
+const char* FIRMWARE_VERSION = "2.3.0";
 
 // ─── Aprovisionamiento WiFi (Access Point + portal HTTP) ────────────────────
 // El WiFi y el DEVICE_ID YA NO se hardcodean: los entrega la app AquaSave.
@@ -99,7 +99,9 @@ const int UMBRAL_RIEGO_PCT = 40;   // regar por debajo de este % de humedad
 const int SUELO_HUMEDO_PCT = 70;   // objetivo: cortar el pulso al llegar aqui
 
 const unsigned long PULSO_RIEGO_MS      = 60UL * 1000UL;        // 1 minuto
-const unsigned long ESPERA_TRAS_PULSO_MS = 60UL * 60UL * 1000UL; // 1 hora
+// Descanso entre pulsos: 5 min para pruebas/demo. En produccion subir a
+// 1 hora (60UL * 60UL * 1000UL) para dar tiempo real de absorcion.
+const unsigned long ESPERA_TRAS_PULSO_MS = 5UL * 60UL * 1000UL;  // 5 minutos
 
 // Refuerzo por clima: si hace calor y el aire esta seco, tambien dispara un
 // pulso aunque el suelo este en zona intermedia (respetando el descanso).
@@ -137,6 +139,11 @@ unsigned long tiempoAnterior = 0;
 // Pulsos del riego automatico.
 unsigned long pulsoInicioMs   = 0;  // inicio del pulso en curso
 unsigned long ultimoPulsoFinMs = 0; // fin del ultimo pulso (0 = nunca rego)
+
+// false cuando el ADC lee fuera del rango fisico plausible (sensor
+// desconectado o roto). Fail-safe: sin lectura confiable NO hay riego
+// automatico (un sensor suelto leeria "0 %" y regaria cada hora por siempre).
+bool sensorSueloValido = true;
 
 // Pausa remota (comando pause-device desde la app). Persistida en NVS: un
 // dispositivo pausado no riega (ni auto ni manual) hasta recibir
@@ -218,6 +225,29 @@ void setup() {
 //  LOOP
 // ═════════════════════════════════════════════════════════════════════════════
 
+// Corte de seguridad por TIEMPO, evaluado en CADA iteracion del loop (no
+// solo en el tick de lectura de 5 s): aunque una operacion se demore, la
+// bomba se apaga a tiempo. Toda salida marca el descanso entre pulsos para
+// que el modo automatico no vuelva a regar segundos despues.
+void seguridadBomba() {
+  if (modo == MODO_AUTO && bombaEncendida &&
+      millis() - pulsoInicioMs >= PULSO_RIEGO_MS) {
+    bombaEncendida   = false;
+    ultimoPulsoFinMs = millis();
+    digitalWrite(PIN_RELE, LOW);
+    Serial.println("[RIEGO] Pulso completo: esperando absorcion del agua");
+  }
+
+  if (modo == MODO_MANUAL_ON &&
+      millis() - manualDesdeMs >= MANUAL_MAX_MS) {
+    modo             = MODO_AUTO;
+    bombaEncendida   = false;
+    ultimoPulsoFinMs = millis();  // descanso tambien tras el manual
+    digitalWrite(PIN_RELE, LOW);
+    Serial.println("[RIEGO] Manual: tiempo maximo alcanzado, vuelvo a AUTO");
+  }
+}
+
 void loop() {
   // En modo aprovisionamiento el ESP32 solo sirve el portal HTTP del AP.
   if (provisioningMode) {
@@ -226,6 +256,7 @@ void loop() {
   }
 
   vigilarBotonReset();
+  seguridadBomba();
 
   mantenerConexiones();
   mqtt.loop();
@@ -238,6 +269,8 @@ void loop() {
 
     const int adcSuelo = analogRead(PIN_SENSOR_SUELO);
     const int humedadSueloPct = adcAporcentaje(adcSuelo);
+    sensorSueloValido =
+      adcSuelo >= ADC_VALIDO_MIN && adcSuelo <= ADC_VALIDO_MAX;
 
     actualizarBomba(humedadSueloPct);
     digitalWrite(PIN_RELE, bombaEncendida ? HIGH : LOW);
@@ -525,7 +558,8 @@ void leerDHTSiToca() {
   }
 
   fallosDhtSeguidos++;
-  if (fallosDhtSeguidos >= 10) {
+  // La re-deteccion bloquea ~15 s: nunca con la bomba encendida.
+  if (fallosDhtSeguidos >= 10 && !bombaEncendida) {
     Serial.println("[DHT] 10 fallas seguidas, re-detectando tipo...");
     fallosDhtSeguidos = 0;
     detectarDHT();
@@ -612,15 +646,15 @@ void actualizarBomba(int humedadSueloPct) {
   }
 
   if (modo == MODO_MANUAL_ON) {
-    const bool timeout  = millis() - manualDesdeMs >= MANUAL_MAX_MS;
-    const bool saturado = humedadSueloPct >= SUELO_SATURADO_PCT;
+    // (El corte por tiempo maximo lo hace seguridadBomba() en cada loop.)
+    const bool saturado =
+      sensorSueloValido && humedadSueloPct >= SUELO_SATURADO_PCT;
 
-    if (timeout || saturado) {
-      Serial.println(timeout
-        ? "[RIEGO] Manual: tiempo maximo alcanzado, vuelvo a AUTO"
-        : "[RIEGO] Manual: suelo saturado, corte de seguridad");
+    if (saturado) {
+      Serial.println("[RIEGO] Manual: suelo saturado, corte de seguridad");
       modo = MODO_AUTO;
       bombaEncendida = false;
+      ultimoPulsoFinMs = millis();  // descanso tambien tras el manual
     } else {
       bombaEncendida = true;
     }
@@ -632,6 +666,16 @@ void actualizarBomba(int humedadSueloPct) {
   // Nunca deja la bomba encendida de forma continua: riega PULSO_RIEGO_MS,
   // descansa ESPERA_TRAS_PULSO_MS para que el agua se absorba, y solo si el
   // suelo sigue seco vuelve a regar.
+
+  // Fail-safe: sin lectura confiable del sensor NO se riega en automatico.
+  if (!sensorSueloValido) {
+    if (bombaEncendida) {
+      bombaEncendida   = false;
+      ultimoPulsoFinMs = millis();
+      Serial.println("[RIEGO] Pulso cortado: lectura del sensor invalida");
+    }
+    return;
+  }
 
   if (bombaEncendida) {
     // Pulso en curso: cortar al cumplir el tiempo o al llegar al objetivo.
@@ -736,6 +780,10 @@ void mantenerConexiones() {
   }
 
   if (!mqtt.connected() && millis() - ultimoIntentoMqttMs >= 5000) {
+    // La reconexion TLS puede bloquear varios segundos y estirar un pulso;
+    // durante un pulso automatico (max 1 min) se pospone. En manual no se
+    // pospone: reconectar es la unica via para recibir close-valve.
+    if (modo == MODO_AUTO && bombaEncendida) return;
     ultimoIntentoMqttMs = millis();
     conectarMqtt();
   }
@@ -760,6 +808,7 @@ void publicarTelemetria(int humedadSueloPct, int adcRaw) {
   // ADC crudo para diagnostico/calibracion (el edge lo ignora; visible en el
   // web client de HiveMQ).
   doc["adcRaw"] = adcRaw;
+  doc["soilSensorOk"] = sensorSueloValido;
 
   if (hayLecturaDHT()) {
     doc["temperatureC"] = serialized(String(ultimaTemperatura, 1));
@@ -846,7 +895,8 @@ void imprimirLectura(int adcSuelo, int humedadSueloPct) {
   Serial.println();
   Serial.println("========== NUEVA LECTURA ==========");
   Serial.printf("Device: %s\n", DEVICE_ID.c_str());
-  Serial.printf("ADC suelo: %d (%d %%)\n", adcSuelo, humedadSueloPct);
+  Serial.printf("ADC suelo: %d (%d %%)%s\n", adcSuelo, humedadSueloPct,
+                sensorSueloValido ? "" : "  [SENSOR INVALIDO - sin riego auto]");
 
   Serial.print("Estado suelo: ");
   if (humedadSueloPct <= UMBRAL_RIEGO_PCT) Serial.println("SECO");
