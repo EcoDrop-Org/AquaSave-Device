@@ -34,7 +34,7 @@ const uint16_t MQTT_PORT = 8883;
 const char* MQTT_USERNAME = "aquasave-edge";
 const char* MQTT_PASSWORD_MQTT = "Aquasave123";
 
-const char* FIRMWARE_VERSION = "2.3.0";
+const char* FIRMWARE_VERSION = "2.3.1";
 
 // ─── Aprovisionamiento WiFi (Access Point + portal HTTP) ────────────────────
 // El WiFi y el DEVICE_ID YA NO se hardcodean: los entrega la app AquaSave.
@@ -518,16 +518,16 @@ bool probarTipoDHT(uint8_t tipo, const char* nombre) {
 }
 
 void detectarDHT() {
-  Serial.println("[DHT] Detectando sensor (DHT11 / DHT22)...");
+  Serial.println("[DHT] Detectando sensor (DHT22 / DHT11)...");
 
-  if (probarTipoDHT(DHT11, "DHT11")) {
-    dhtTipoActual = DHT11;
+  if (probarTipoDHT(DHT22, "DHT22")) {
+    dhtTipoActual = DHT22;
     dhtDetectado = true;
     return;
   }
 
-  if (probarTipoDHT(DHT22, "DHT22")) {
-    dhtTipoActual = DHT22;
+  if (probarTipoDHT(DHT11, "DHT11")) {
+    dhtTipoActual = DHT11;
     dhtDetectado = true;
     return;
   }
@@ -537,7 +537,7 @@ void detectarDHT() {
 }
 
 bool lecturaCoherente(float t, float h) {
-  return t > -20.0 && t < 60.0 && h >= 1.0 && h <= 100.0;
+  return t > -20.0 && t < 60.0 && h >= 10.0 && h <= 100.0;
 }
 
 void leerDHTSiToca() {
