@@ -98,7 +98,7 @@ int adcMojadoGuardado  = 0;
 const int UMBRAL_RIEGO_PCT = 40;   // regar por debajo de este % de humedad
 const int SUELO_HUMEDO_PCT = 70;   // objetivo: cortar el pulso al llegar aqui
 
-const unsigned long PULSO_RIEGO_MS      = 60UL * 1000UL;        // 1 minuto
+const unsigned long PULSO_RIEGO_MS      = 5UL * 1000UL;         // 5 segundos
 // Descanso entre pulsos: 5 min para pruebas/demo. En produccion subir a
 // 1 hora (60UL * 60UL * 1000UL) para dar tiempo real de absorcion.
 const unsigned long ESPERA_TRAS_PULSO_MS = 5UL * 60UL * 1000UL;  // 5 minutos
@@ -781,7 +781,7 @@ void mantenerConexiones() {
 
   if (!mqtt.connected() && millis() - ultimoIntentoMqttMs >= 5000) {
     // La reconexion TLS puede bloquear varios segundos y estirar un pulso;
-    // durante un pulso automatico (max 1 min) se pospone. En manual no se
+    // durante un pulso automatico (max 5 s) se pospone. En manual no se
     // pospone: reconectar es la unica via para recibir close-valve.
     if (modo == MODO_AUTO && bombaEncendida) return;
     ultimoIntentoMqttMs = millis();
