@@ -98,7 +98,7 @@ int adcMojadoGuardado  = 0;
 const int UMBRAL_RIEGO_PCT = 40;   // regar por debajo de este % de humedad
 const int SUELO_HUMEDO_PCT = 70;   // objetivo: cortar el pulso al llegar aqui
 
-const unsigned long PULSO_RIEGO_MS      = 5UL * 1000UL;         // 5 segundos
+const unsigned long PULSO_RIEGO_MS      = 3UL * 1000UL;         // 3 segundos
 // Descanso entre pulsos: 5 min para pruebas/demo. En produccion subir a
 // 1 hora (60UL * 60UL * 1000UL) para dar tiempo real de absorcion.
 const unsigned long ESPERA_TRAS_PULSO_MS = 5UL * 60UL * 1000UL;  // 5 minutos
@@ -453,6 +453,9 @@ void iniciarModoAP() {
 
   const String apName = String(AP_PREFIX) + sufijoMac();
   WiFi.mode(WIFI_AP_STA);  // AP para el portal + STA para escanear redes
+  // Potencia de TX reducida: baja el pico de corriente al levantar el radio,
+  // para evitar brownout con fuentes de alimentacion limitadas.
+  WiFi.setTxPower(WIFI_POWER_11dBm);
   WiFi.softAP(apName.c_str(), AP_PASSWORD);
 
   const IPAddress ip = WiFi.softAPIP();
@@ -781,7 +784,7 @@ void mantenerConexiones() {
 
   if (!mqtt.connected() && millis() - ultimoIntentoMqttMs >= 5000) {
     // La reconexion TLS puede bloquear varios segundos y estirar un pulso;
-    // durante un pulso automatico (max 5 s) se pospone. En manual no se
+    // durante un pulso automatico (max 3 s) se pospone. En manual no se
     // pospone: reconectar es la unica via para recibir close-valve.
     if (modo == MODO_AUTO && bombaEncendida) return;
     ultimoIntentoMqttMs = millis();
